@@ -219,6 +219,39 @@ payment_executor.process_payment(
 );
 ```
 
+### Payroll Approval Threshold
+
+Employers can require a configurable number of distinct reviewers to approve a
+prepared payroll run before it executes. The policy is opt-in: without it,
+`finalize_payroll_run` behaves exactly as before.
+
+```rust
+// Admin: require 2 of the authorized reviewers (needs >= 2 reviewers, max 10).
+payroll.set_approval_threshold(&admin, &2);
+
+let run_id = payroll.prepare_payroll_run(&proofs, &amounts, &employees, &total, &nonce, &None);
+payroll.approve_payroll_run(&reviewer_a, &run_id);
+payroll.approve_payroll_run(&reviewer_b, &run_id);
+
+// progress.required == 2, progress.approved == 2, progress.threshold_met == true
+let progress = payroll.get_approval_progress(&run_id);
+payroll.finalize_payroll_run(&admin, &run_id);
+```
+
+- **Counted approvals**: one per reviewer; an approval stops counting when it
+  expires (`DEFAULT_APPROVAL_EXPIRY_SECONDS`) or its reviewer is removed.
+- **Objections reset the quorum**: `reject_payroll_run` and
+  `request_changes_payroll_run` clear all recorded approvals for the run.
+- **Direct execution is disabled** while a threshold is set:
+  `batch_process_payroll*` fail and the dry-run reports
+  `ApprovalWorkflowRequired`. Use prepare → approve → finalize instead.
+- **Locked during in-flight runs**: the threshold cannot be changed or cleared
+  (`clear_approval_threshold`) while any run is pending.
+- **Privacy**: failures report only approval counts, never amounts or employees.
+
+See [docs/security/reviewer-authorization.md](docs/security/reviewer-authorization.md#24-payroll-approval-threshold)
+for the full rules and failure messages.
+
 ### Employee Payout Destination Updates
 
 Employees can securely manage and update their payment receiving addresses:

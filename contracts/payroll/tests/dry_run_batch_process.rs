@@ -172,9 +172,9 @@ fn dry_run_never_writes_run_nonce_state() {
 #[test]
 fn asset_not_allowed_is_reported_by_default() {
     let env = Env::default();
-    let (client, _token, employee) = common::setup(&env);
-    // Deliberately skip allow_token: common::setup never allowlists its
-    // token on its own.
+    let (client, token, employee) = common::setup(&env);
+    // `initialize` allowlists the payout token, so remove it explicitly.
+    client.set_asset_allowed(&token, &false);
 
     let report = client.dry_run_batch_process_payroll(&args(&env, &employee, 100, 1));
     assert!(report

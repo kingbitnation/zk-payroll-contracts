@@ -2,13 +2,16 @@
 use soroban_sdk::xdr::ToXdr;
 use soroban_sdk::{
     contract, contractimpl, contracttype, symbol_short, token as soroban_token, Address, Bytes,
-    BytesN, Env, Symbol, Vec,
+    BytesN, Env, String, Symbol, Vec,
 };
 
 use pause_manager::PauseManagerClient;
 use proof_verifier::ProofVerifierClient;
 use salary_commitment::SalaryCommitmentContractClient;
 use shared_errors::{AuthError, PaymentError, TreasuryError};
+
+pub mod approvals;
+pub use approvals::{ApprovalProgress, RunApproval, MAX_APPROVAL_THRESHOLD, MAX_RUN_APPROVALS};
 
 pub mod config_audit;
 use config_audit::{config_keys, no_value_ref, record_config_change, stored_ref, value_ref};
@@ -22,6 +25,7 @@ use signed_operator_actions::{
 };
 
 const MAX_BATCH: u32 = 50;
+const MAX_DRAFT_DESCRIPTION_BYTES: u32 = 256;
 
 #[contract]
 pub struct Payroll;
@@ -949,6 +953,15 @@ pub enum DataKey {
     /// SHA-256'd XDR encoding) as already consumed, preventing replay of
     /// the exact same signed payload (#519).
     ConsumedOperatorAuth(BytesN<32>),
+    /// Number of distinct live reviewer approvals `finalize_payroll_run`
+    /// requires. Absent means no threshold, matching the pre-existing
+    /// single-review workflow.
+    ApprovalThreshold,
+    /// Reviewer approvals recorded for a payroll run, counted against
+    /// `ApprovalThreshold` at finalization.
+    RunApprovals(u64),
+    /// Operator-facing description attached to a payroll run draft.
+    RunDraftDescription(u64),
     // Future upgrade example (issue #196):
     // PayrollRunV2(u64),  // Would be added here when schema evolution is needed
 }
@@ -3053,6 +3066,7 @@ impl Payroll {
 
         // Validate approval expiry if a review exists (#403)
         Self::validate_approval_not_expired(&e, run_id, DEFAULT_APPROVAL_EXPIRY_SECONDS);
+        approvals::require_threshold_met(&e, run_id);
 
         // Issue #218: Check if run has already been finalized
         // Once a run is executed, it cannot be cancelled
@@ -3302,6 +3316,7 @@ impl Payroll {
         draft_hash: Option<BytesN<32>>,
     ) -> u64 {
         Self::require_company_active(&e);
+        approvals::require_no_threshold_for_direct_execution(&e);
 
         // #360 - validate storage version for sensitive operation
         Self::validate_storage_version_for_operation(&e, "batch_process_payroll");
@@ -3524,6 +3539,9 @@ impl Payroll {
         if !Self::company_is_active(&e) {
             report.push(PayrollFailureReason::CompanyNotActive);
         }
+        if approvals::threshold(&e).is_some() {
+            report.push(PayrollFailureReason::ApprovalWorkflowRequired);
+        }
 
         let count = args.proof_count;
         if count == 0 {
@@ -3743,6 +3761,7 @@ impl Payroll {
         batch_size: u32,
     ) -> u64 {
         Self::require_company_active(&e);
+        approvals::require_no_threshold_for_direct_execution(&e);
 
         Self::validate_storage_version_for_operation(&e, "batch_process_payroll_bounded");
 
@@ -4176,6 +4195,44 @@ impl Payroll {
         draft.updated_at
     }
 
+    /// Attach or replace the description of a pending payroll run draft.
+    /// Only the admin may call. The description must contain a
+    /// non-whitespace character and be at most 256 bytes.
+    pub fn set_run_draft_description(e: Env, admin: Address, draft_id: u64, description: String) {
+        Self::require_not_paused(&e);
+        Self::validate_draft_id(draft_id);
+        let addrs: ContractAddresses = e
+            .storage()
+            .persistent()
+            .get(&DataKey::Addresses)
+            .expect("Not initialized");
+        if admin != addrs.admin {
+            panic!("Unauthorized");
+        }
+        admin.require_auth();
+
+        let draft: PayrollRunDraft = e
+            .storage()
+            .persistent()
+            .get(&DataKey::RunDraft(draft_id))
+            .expect("Draft not found");
+        if draft.state != RunDraftState::Pending {
+            panic!("Only pending drafts can be amended");
+        }
+        Self::validate_draft_description(&description);
+
+        e.storage()
+            .persistent()
+            .set(&DataKey::RunDraftDescription(draft_id), &description);
+    }
+
+    /// Return the description attached to a payroll run draft, if any.
+    pub fn get_run_draft_description(e: Env, draft_id: u64) -> Option<String> {
+        e.storage()
+            .persistent()
+            .get(&DataKey::RunDraftDescription(draft_id))
+    }
+
     /// Return whether a draft transition is allowed by the draft state machine.
     pub fn is_draft_transition_allowed(_e: Env, from: RunDraftState, to: RunDraftState) -> bool {
         Self::is_allowed_draft_state_transition_internal(from, to)
@@ -4232,16 +4289,9 @@ impl Payroll {
         // Issue #471: the period is now final — auto-freeze it so no further
         // payroll edits can slip in after submission without an explicit
         // authorized unfreeze.
-        let freeze_key = DataKey::PeriodFreeze(draft.period_label.clone());
+        let freeze_key = DataKey::PeriodConfigFrozen(draft.period_label.clone());
         if !e.storage().persistent().has(&freeze_key) {
-            let freeze = PeriodFreeze {
-                period_label: draft.period_label.clone(),
-                frozen_by: admin.clone(),
-                frozen_at: e.ledger().timestamp(),
-                reason: Symbol::new(&e, "finalized"),
-                runs_count: Self::count_runs_for_period(&e, &draft.period_label),
-            };
-            e.storage().persistent().set(&freeze_key, &freeze);
+            e.storage().persistent().set(&freeze_key, &true);
 
             payroll_events::emit_period_frozen(
                 &e,
@@ -5349,10 +5399,19 @@ impl Payroll {
         }
     }
 
-    /// Count executed runs recorded for a given period.
-    fn count_runs_for_period(e: &Env, period: &Symbol) -> u32 {
-        let usage = Self::get_period_usage(e.clone(), period.clone());
-        usage.batch_count
+    /// Panic when a period carries an explicit freeze marker and must not
+    /// receive payroll draft edits or submissions (#471). Settlement-ready
+    /// periods are not rejected here: drafts are submitted during the
+    /// execution window.
+    fn require_period_not_frozen(e: &Env, period: &Symbol) {
+        let frozen: bool = e
+            .storage()
+            .persistent()
+            .get(&DataKey::PeriodConfigFrozen(period.clone()))
+            .unwrap_or(false);
+        if frozen {
+            panic!("Payroll period is frozen: payroll drafts for this period cannot be changed");
+        }
     }
 
     /// Panic when a period's configuration is frozen and must not be edited.
@@ -5736,6 +5795,7 @@ impl Payroll {
             .persistent()
             .remove(&DataKey::PayrollState(run_id));
         e.storage().persistent().remove(&DataKey::RunReview(run_id));
+        approvals::clear_approvals(&e, run_id);
 
         payroll_events::emit_run_pruned(&e, run_id, admin.clone());
         payroll_events::emit_retention_pruned(&e, Symbol::new(&e, "finalized_run"), run_id, admin);
@@ -5772,6 +5832,7 @@ impl Payroll {
         e.storage()
             .persistent()
             .remove(&DataKey::PayrollState(run_id));
+        approvals::clear_approvals(&e, run_id);
         payroll_events::emit_retention_pruned(
             &e,
             Symbol::new(&e, "cancelled_batch"),
@@ -6176,6 +6237,102 @@ impl Payroll {
             .unwrap_or(0)
     }
 
+    // ── Configurable payroll approval threshold ──────────────────────────────
+
+    /// Require `threshold` distinct, live reviewer approvals before
+    /// `finalize_payroll_run` may execute a prepared run. Only the admin may
+    /// call. While a threshold is configured, the direct execution
+    /// entrypoints (`batch_process_payroll*`) are unavailable.
+    ///
+    /// Rejected when `threshold` is zero (use `clear_approval_threshold`),
+    /// exceeds `MAX_APPROVAL_THRESHOLD`, or exceeds the number of currently
+    /// authorized reviewers (an unreachable threshold would block payroll).
+    /// Locked while any payroll run is pending, so the bar cannot move under
+    /// an in-flight run.
+    pub fn set_approval_threshold(e: Env, admin: Address, threshold: u32) {
+        let addrs: ContractAddresses = e
+            .storage()
+            .persistent()
+            .get(&DataKey::Addresses)
+            .expect("Not initialized");
+        if admin != addrs.admin {
+            panic!("Unauthorized");
+        }
+        admin.require_auth();
+        Self::require_no_active_payroll_run(&e);
+
+        if threshold == 0 {
+            panic!("Approval threshold must be positive: use clear_approval_threshold to disable");
+        }
+        if threshold > MAX_APPROVAL_THRESHOLD {
+            panic!("Approval threshold exceeds the maximum supported value");
+        }
+        if threshold > Self::get_reviewer_count(e.clone()) {
+            panic!("Approval threshold exceeds the number of authorized reviewers");
+        }
+
+        let previous_ref = stored_ref(&e, &DataKey::ApprovalThreshold);
+        e.storage()
+            .persistent()
+            .set(&DataKey::ApprovalThreshold, &threshold);
+
+        payroll_events::emit_approval_threshold_set(&e, threshold);
+        record_config_change(
+            &e,
+            &admin,
+            config_keys::APPROVAL_THRESHOLD,
+            no_value_ref(&e),
+            previous_ref,
+            stored_ref(&e, &DataKey::ApprovalThreshold),
+        );
+    }
+
+    /// Remove the approval threshold, restoring the default workflow in
+    /// which finalization and direct execution need no approval quorum.
+    /// Only the admin may call; locked while any payroll run is pending.
+    pub fn clear_approval_threshold(e: Env, admin: Address) {
+        let addrs: ContractAddresses = e
+            .storage()
+            .persistent()
+            .get(&DataKey::Addresses)
+            .expect("Not initialized");
+        if admin != addrs.admin {
+            panic!("Unauthorized");
+        }
+        admin.require_auth();
+        Self::require_no_active_payroll_run(&e);
+
+        let previous_ref = stored_ref(&e, &DataKey::ApprovalThreshold);
+        e.storage().persistent().remove(&DataKey::ApprovalThreshold);
+
+        payroll_events::emit_approval_threshold_set(&e, 0);
+        record_config_change(
+            &e,
+            &admin,
+            config_keys::APPROVAL_THRESHOLD,
+            no_value_ref(&e),
+            previous_ref,
+            stored_ref(&e, &DataKey::ApprovalThreshold),
+        );
+    }
+
+    /// Return the configured approval threshold, if any.
+    pub fn get_approval_threshold(e: Env) -> Option<u32> {
+        approvals::threshold(&e)
+    }
+
+    /// Return every approval recorded for a run, including approvals that no
+    /// longer count because they expired or their reviewer was revoked.
+    pub fn get_run_approvals(e: Env, run_id: u64) -> Vec<RunApproval> {
+        approvals::run_approvals(&e, run_id)
+    }
+
+    /// Return how many live approvals a run has against the configured
+    /// threshold. Contains counts only — no payroll amounts or identities.
+    pub fn get_approval_progress(e: Env, run_id: u64) -> ApprovalProgress {
+        approvals::progress(&e, run_id)
+    }
+
     // ── Issue #519: signed, expiring operator authorizations ────────────────
 
     /// Register (or replace) the ed25519 public key that signs off-chain
@@ -6306,12 +6463,18 @@ impl Payroll {
     }
 
     /// Approve a payroll run as an authorized reviewer.
+    ///
+    /// Each reviewer may hold at most one live approval per run; a repeated
+    /// approval is rejected rather than counted twice toward the approval
+    /// threshold.
     pub fn approve_payroll_run(e: Env, reviewer: Address, run_id: u64) {
         Self::require_not_paused(&e);
         if !Self::is_reviewer(e.clone(), reviewer.clone()) {
             panic!("Unauthorized: caller is not an authorized reviewer");
         }
         reviewer.require_auth();
+
+        approvals::record_approval(&e, run_id, &reviewer);
 
         let review = RunReview {
             run_id,
@@ -6327,13 +6490,16 @@ impl Payroll {
         payroll_events::emit_run_approved(&e, run_id, reviewer);
     }
 
-    /// Reject a payroll run as an authorized reviewer.
+    /// Reject a payroll run as an authorized reviewer. Clears every recorded
+    /// approval for the run.
     pub fn reject_payroll_run(e: Env, reviewer: Address, run_id: u64, reason: Symbol) {
         Self::require_not_paused(&e);
         if !Self::is_reviewer(e.clone(), reviewer.clone()) {
             panic!("Unauthorized: caller is not an authorized reviewer");
         }
         reviewer.require_auth();
+
+        approvals::clear_approvals(&e, run_id);
 
         let review = RunReview {
             run_id,
@@ -6349,13 +6515,16 @@ impl Payroll {
         payroll_events::emit_run_rejected(&e, run_id, reviewer, reason);
     }
 
-    /// Request changes to a payroll run as an authorized reviewer.
+    /// Request changes to a payroll run as an authorized reviewer. Clears
+    /// every recorded approval for the run.
     pub fn request_changes_payroll_run(e: Env, reviewer: Address, run_id: u64, reason: Symbol) {
         Self::require_not_paused(&e);
         if !Self::is_reviewer(e.clone(), reviewer.clone()) {
             panic!("Unauthorized: caller is not an authorized reviewer");
         }
         reviewer.require_auth();
+
+        approvals::clear_approvals(&e, run_id);
 
         let review = RunReview {
             run_id,
@@ -7123,7 +7292,7 @@ impl Payroll {
     // ────────────────────────────────────────────────────────────────────────────
 
     /// Validate that a period is suitable for cloning/templating.
-    pub fn validate_period_for_cloning(e: Env, period: Symbol) -> Result<(), ()> {
+    pub fn validate_period_for_cloning(e: Env, period: Symbol) {
         Self::validate_symbol_not_empty(&e, &period, "period");
 
         // Check if period is frozen
@@ -7138,8 +7307,6 @@ impl Payroll {
         {
             panic!("Source period has no settlement window configured");
         }
-
-        Ok(())
     }
 
     // ────────────────────────────────────────────────────────────────────────────
@@ -7147,7 +7314,7 @@ impl Payroll {
     // ────────────────────────────────────────────────────────────────────────────
 
     /// Verify draft checksum matches between preparation and finalization.
-    pub fn verify_draft_checksum(e: &Env, run_id: u64, provided_hash: BytesN<32>) -> Result<(), ()> {
+    pub fn verify_draft_checksum(e: &Env, run_id: u64, provided_hash: BytesN<32>) {
         let pending_run: PendingPayrollRun = e
             .storage()
             .persistent()
@@ -7157,8 +7324,6 @@ impl Payroll {
         if pending_run.draft_hash != provided_hash {
             panic!("Draft checksum mismatch: payroll data was modified after review");
         }
-
-        Ok(())
     }
 }
 

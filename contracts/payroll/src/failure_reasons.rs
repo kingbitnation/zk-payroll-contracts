@@ -68,6 +68,10 @@ pub enum PayrollFailureReason {
     SettlementWindowNotOpen = 13,
     /// The treasury's token balance is less than `expected_total_spend`.
     InsufficientTreasuryBalance = 14,
+    /// An approval threshold is configured, so direct execution is
+    /// unavailable: use `prepare_payroll_run`, collect reviewer approvals,
+    /// then `finalize_payroll_run`.
+    ApprovalWorkflowRequired = 15,
 }
 
 /// Result of a dry-run preflight check for `batch_process_payroll`.

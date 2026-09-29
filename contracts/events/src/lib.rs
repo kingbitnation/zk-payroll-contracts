@@ -815,6 +815,22 @@ pub fn emit_draft_submitted(e: &Env, draft_id: u64, admin: Address) {
     );
 }
 
+/// Emitted when a payroll period is frozen against further payroll edits.
+pub fn emit_period_frozen(e: &Env, period_label: Symbol, frozen_by: Address, reason: Symbol) {
+    e.events().publish(
+        (payroll_topic(), Symbol::new(e, "period_frozen")),
+        (period_label, frozen_by, reason),
+    );
+}
+
+/// Emitted when a frozen payroll period is unfrozen for correction.
+pub fn emit_period_unfrozen(e: &Env, period_label: Symbol, unfrozen_by: Address) {
+    e.events().publish(
+        (payroll_topic(), Symbol::new(e, "period_unfrozen")),
+        (period_label, unfrozen_by),
+    );
+}
+
 /// Emitted when a payroll run draft is cancelled.
 pub fn emit_draft_cancelled(e: &Env, draft_id: u64, admin: Address) {
     e.events().publish(
@@ -1021,6 +1037,15 @@ pub fn emit_max_reviewers_set(e: &Env, max_reviewers: u32) {
     e.events().publish(
         (payroll_topic(), Symbol::new(e, "max_reviewers_set")),
         max_reviewers,
+    );
+}
+
+/// Emitted when the payroll approval threshold is set or replaced by admin.
+/// `threshold == 0` means the threshold was cleared.
+pub fn emit_approval_threshold_set(e: &Env, threshold: u32) {
+    e.events().publish(
+        (payroll_topic(), Symbol::new(e, "approval_threshold_set")),
+        threshold,
     );
 }
 
