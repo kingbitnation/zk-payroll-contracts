@@ -62,7 +62,7 @@ Removing a reviewer is never blocked by the approval threshold (§2.4), so a com
 
 An approval counts toward the threshold only while its reviewer is still authorized and it is no older than `DEFAULT_APPROVAL_EXPIRY_SECONDS` (inclusive boundary, matching §3.1). A reviewer whose approval expired may approve again. At most `MAX_RUN_APPROVALS` (20) live approvals are stored per run.
 
-While a threshold is set, `batch_process_payroll`, `batch_process_payroll_idempotent`, and `batch_process_payroll_bounded` are unavailable: they assign the run ID at execution time, so approvals could never be collected for them. `dry_run_batch_process_payroll` reports `PayrollFailureReason::ApprovalWorkflowRequired` (15). A bounded batch started before a threshold was set cannot resume until the threshold is cleared.
+While a threshold is set, `batch_process_payroll`, `batch_process_payroll_idempotent`, `batch_process_payroll_bounded`, and `batch_process_with_expiry` are unavailable: they assign the run ID at execution time, so approvals could never be collected for them. `dry_run_batch_process_payroll` reports `PayrollFailureReason::ApprovalWorkflowRequired` (23). A bounded batch started before a threshold was set cannot resume until the threshold is cleared.
 
 ---
 
@@ -77,6 +77,10 @@ An authorized reviewer can submit one of three review decisions for a `run_id`:
 | **Request Changes** | `ReviewDecision::ChangesRequested` | Flags the run for modification or correction off-chain before re-submission. |
 
 A reviewer may hold only one live approval per run; approving again is rejected with `Duplicate approval: reviewer has already approved this payroll run`. Rejecting or requesting changes clears every recorded approval for the run, so a fresh quorum is needed afterwards.
+
+Approval corrections (#522) keep the threshold consistent without resetting the quorum:
+- `withdraw_approval(reviewer, run_id, reason)` records `ReviewDecision::Withdrawn` and removes only that reviewer's approval from the count. A withdrawal is not treated as an objection.
+- `supersede_approval(reviewer, run_id)` moves the counted approval from the previous approver to `reviewer`. It is rejected with the duplicate-approval message if `reviewer` already holds a live approval.
 
 ### 3.1 Finalization Checks
 `finalize_payroll_run` applies these approval checks, in order:

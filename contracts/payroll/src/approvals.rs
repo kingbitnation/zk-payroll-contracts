@@ -12,7 +12,9 @@
 //! - it is within `DEFAULT_APPROVAL_EXPIRY_SECONDS` of when it was recorded.
 //!
 //! A rejection or change request clears every recorded approval for the run,
-//! so execution always requires a fresh quorum after an objection.
+//! so execution always requires a fresh quorum after an objection. A
+//! withdrawn approval (#522) removes only that reviewer's approval, and a
+//! superseded approval moves to the superseding reviewer.
 //!
 //! Only reviewer addresses, counts, and timestamps are stored or reported;
 //! salary amounts, employee identities, and proof material never are.
@@ -109,6 +111,24 @@ pub(crate) fn record_approval(e: &Env, run_id: u64, reviewer: &Address) {
         .set(&DataKey::RunApprovals(run_id), &approvals);
 }
 
+/// Drop `reviewer`'s approval of `run_id`, if any, so it no longer counts
+/// toward the threshold.
+pub(crate) fn remove_approval(e: &Env, run_id: u64, reviewer: &Address) {
+    let mut remaining = Vec::new(e);
+    for approval in run_approvals(e, run_id).iter() {
+        if approval.reviewer != *reviewer {
+            remaining.push_back(approval);
+        }
+    }
+    if remaining.is_empty() {
+        clear_approvals(e, run_id);
+    } else {
+        e.storage()
+            .persistent()
+            .set(&DataKey::RunApprovals(run_id), &remaining);
+    }
+}
+
 pub(crate) fn clear_approvals(e: &Env, run_id: u64) {
     e.storage()
         .persistent()
@@ -135,7 +155,10 @@ pub(crate) fn require_threshold_met(e: &Env, run_id: u64) {
     let latest_review: Option<RunReview> =
         e.storage().persistent().get(&DataKey::RunReview(run_id));
     if let Some(review) = latest_review {
-        if review.decision != ReviewDecision::Approved {
+        if matches!(
+            review.decision,
+            ReviewDecision::Rejected | ReviewDecision::ChangesRequested
+        ) {
             panic!(
                 "Payroll run has an outstanding rejection or change request: collect fresh approvals before finalizing"
             );

@@ -55,6 +55,7 @@ struct TestContext<'a> {
     treasury_owner: Address,
     employee: Address,
     pause_manager_client: PauseManagerClient<'a>,
+    import_source: Address,
 }
 
 fn setup_payroll(env: &Env) -> TestContext {
@@ -99,6 +100,9 @@ fn setup_payroll(env: &Env) -> TestContext {
     let employee = Address::generate(env);
     commitment_client.store_commitment(&employee, &BytesN::from_array(env, &[0u8; 32]));
 
+    let import_source = Address::generate(env);
+    payroll_client.register_import_source(&import_source, &0u32);
+
     TestContext {
         env: env.clone(),
         payroll: payroll_client,
@@ -107,6 +111,7 @@ fn setup_payroll(env: &Env) -> TestContext {
         treasury_owner,
         employee,
         pause_manager_client,
+        import_source,
     }
 }
 

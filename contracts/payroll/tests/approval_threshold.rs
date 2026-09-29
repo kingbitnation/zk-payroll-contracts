@@ -11,7 +11,7 @@ mod common;
 use payroll::failure_reasons::{DryRunArgs, PayrollFailureReason};
 use payroll::{ApprovalProgress, PayrollClient, DEFAULT_APPROVAL_EXPIRY_SECONDS};
 use soroban_sdk::testutils::{Address as _, Ledger as _};
-use soroban_sdk::{Address, Env, Symbol, Vec};
+use soroban_sdk::{Address, BytesN, Env, Symbol, Vec};
 
 struct Fixture<'a> {
     client: PayrollClient<'a>,
@@ -265,6 +265,56 @@ fn change_request_requires_a_fresh_quorum() {
     fx.client.finalize_payroll_run(&fx.admin, &run_id);
 }
 
+#[test]
+fn withdrawn_approval_stops_counting_without_resetting_quorum() {
+    let env = Env::default();
+    let fx = setup_with_reviewers(&env, 3);
+    fx.client.set_approval_threshold(&fx.admin, &2);
+    let run_id = prepare_run(&env, &fx, 1);
+
+    fx.client.approve_payroll_run(&reviewer(&fx, 0), &run_id);
+    fx.client.approve_payroll_run(&reviewer(&fx, 1), &run_id);
+    fx.client
+        .withdraw_approval(&reviewer(&fx, 1), &run_id, &Symbol::new(&env, "recheck"));
+
+    assert_eq!(fx.client.get_approval_progress(&run_id).approved, 1);
+    assert!(fx
+        .client
+        .try_finalize_payroll_run(&fx.admin, &run_id)
+        .is_err());
+
+    fx.client.approve_payroll_run(&reviewer(&fx, 2), &run_id);
+    fx.client.finalize_payroll_run(&fx.admin, &run_id);
+    assert!(fx.client.get_pending_run(&run_id).is_none());
+}
+
+#[test]
+fn superseded_approval_moves_to_the_new_reviewer() {
+    let env = Env::default();
+    let fx = setup_with_reviewers(&env, 3);
+    fx.client.set_approval_threshold(&fx.admin, &2);
+    let run_id = prepare_run(&env, &fx, 1);
+
+    fx.client.approve_payroll_run(&reviewer(&fx, 0), &run_id);
+    fx.client.approve_payroll_run(&reviewer(&fx, 1), &run_id);
+    fx.client.supersede_approval(&reviewer(&fx, 2), &run_id);
+
+    let approvers: Vec<Address> = {
+        let mut list = Vec::new(&env);
+        for approval in fx.client.get_run_approvals(&run_id).iter() {
+            list.push_back(approval.reviewer);
+        }
+        list
+    };
+    assert_eq!(approvers.len(), 2);
+    assert!(approvers.contains(reviewer(&fx, 0)));
+    assert!(approvers.contains(reviewer(&fx, 2)));
+    assert!(!approvers.contains(reviewer(&fx, 1)));
+
+    fx.client.finalize_payroll_run(&fx.admin, &run_id);
+    assert!(fx.client.get_pending_run(&run_id).is_none());
+}
+
 // ── Direct execution while a threshold is configured ─────────────────────────
 
 #[test]
@@ -282,6 +332,7 @@ fn direct_batch_execution_is_blocked_while_threshold_is_set() {
         &100,
         &common::nonce(&env, 1),
         &None,
+        &Address::generate(&env),
     );
 }
 
@@ -305,6 +356,26 @@ fn bounded_batch_execution_is_blocked_while_threshold_is_set() {
 }
 
 #[test]
+#[should_panic(expected = "Approval threshold configured: use prepare_payroll_run")]
+fn expiry_checked_batch_execution_is_blocked_while_threshold_is_set() {
+    let env = Env::default();
+    let fx = setup_with_reviewers(&env, 1);
+    fx.client.set_approval_threshold(&fx.admin, &1);
+
+    let (proofs, amounts, employees) = common::one_payment(&env, &fx.employee);
+    let proof_refs = Vec::from_array(&env, [BytesN::from_array(&env, &[7u8; 32])]);
+    fx.client.batch_process_with_expiry(
+        &proofs,
+        &proof_refs,
+        &amounts,
+        &employees,
+        &100,
+        &common::nonce(&env, 1),
+        &None,
+    );
+}
+
+#[test]
 fn dry_run_reports_approval_workflow_required() {
     let env = Env::default();
     let fx = setup_with_reviewers(&env, 1);
@@ -315,6 +386,11 @@ fn dry_run_reports_approval_workflow_required() {
         nonce: common::nonce(&env, 1),
         draft_hash: None,
         proof_count: 1,
+        sequence: None,
+        source_address: None,
+        contract_period: None,
+        expected_contract_period: None,
+        contract_period_closed: false,
     };
 
     let before = fx.client.dry_run_batch_process_payroll(&args);
